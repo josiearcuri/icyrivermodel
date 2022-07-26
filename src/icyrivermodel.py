@@ -15,23 +15,23 @@ import imageio
 from scipy import interpolate
 
 
-class bankline:
-    """class for bankline objects"""
+class Profile:
+    """class for bank profile objects"""
 
     def __init__(self, x, z, T, t):
         """
-        initialize bankline object
+        initialize profile object
 
         Parameters
         ----------
         x: array
-            x-coordinates of bankline nodes, m
+            x-coordinates of nodes, m
         z: array
-            z-coordinates of bankline nodes, m
+            z-coordinates of nodes, m
         T: array
             riverbank surface temperature at x,z coordinate, degrees C
         t: float
-            representative time - or age - of bankline, days
+            representative time - or age - of profile, days
         """
         self.x = x
         self.z = z
@@ -143,18 +143,18 @@ class IcyRiver:
         self.T[self.river_nodes] = self.river_temp
         self.T[self.air_nodes] = self.air_temp
 
-        # set initial bankline
-        self.bankline_dx = params["bankline_dx"]  # m
-        self.bankline_npts = np.ceil(
+        # set initial profile
+        self.profile_dx = params["profile_dx"]  # m
+        self.profile_npts = np.ceil(
             (self.bank_width + self.bank_height + self.river_half_width)
-            / self.bankline_dx
+            / self.profile_dx
         )
-        x, z = self.create_initial_bankline()
+        x, z = self.create_initial_profile()
         # grab temperature at bnklne nodes
         T, node_ids = self.map_temp_to_bank(x, z)
-        # save first bankline object
-        self.banklines = []
-        self.banklines.append(bankline(x, z, T, 0))
+        # save first profile object
+        self.profiles = []
+        self.profiles.append(Profile(x, z, T, 0))
 
     def run(self):
         """Run simulation from start to finish"""
@@ -178,9 +178,9 @@ class IcyRiver:
             dTdt = -self.grid.calc_flux_div_at_node(self.qT)
             self.T[self.grid.core_nodes] += dTdt[self.grid.core_nodes] * self.dt
 
-            # map temperature to bankline
-            x = self.banklines[-1].x
-            z = self.banklines[-1].z
+            # map temperature to profile
+            x = self.profiles[-1].x
+            z = self.profiles[-1].z
 
             if np.round(self.time, 2) % self.save_dt == 0:
                 self.plot_riverbank_temp()
@@ -194,9 +194,9 @@ class IcyRiver:
             else:
                 E = np.zeros_like(x)
 
-            # update bankline
+            # update profile
             x_eroded = x + E
-            self.banklines.append(bankline(x_eroded, z, T, self.time))
+            self.profiles.append(profile(x_eroded, z, T, self.time))
             # redefine grid boundaries
             self.map_erosion_to_grid(x_eroded, z, E)
 
@@ -206,9 +206,9 @@ class IcyRiver:
         Parameters
         ----------
         x: array
-            x-coordinates of bankline nodes, m
+            x-coordinates of profile nodes, m
         z: array
-            z-coordinates of bankline nodes, m
+            z-coordinates of profile nodes, m
         E: array
             riverbank surface temperature at x,z coordinate, degrees C
 
@@ -288,22 +288,22 @@ class IcyRiver:
 
     def map_temp_to_bank(self, x, z):
         """
-        find temperature values on landlab grid at x,z bankline coordinates
+        find temperature values on landlab grid at x,z profile coordinates
         Parameters
         ----------
         x: array
-            x-coordinates of bankline nodes, m
+            x-coordinates of profile nodes, m
         z: array
-            z-coordinates of bankline nodes, m
+            z-coordinates of profile nodes, m
         E: array
             riverbank surface temperature at x,z coordinate, degrees C
 
         Returns
         --------
         T: array
-            temperatures at bankline nodes
+            temperatures at profile nodes
         node_ids:
-            grid node ids corresponding to bankline nodes
+            grid node ids corresponding to profile nodes
         """
         # find core node nearest x,z, coordinate
         dz = np.concatenate(([0], np.diff(z)))
@@ -335,20 +335,20 @@ class IcyRiver:
         """
         commit subaerial and subaqueous melting
 
-        find temperature values on landlab grid at x,z bankline coordinates
+        find temperature values on landlab grid at x,z profile coordinates
         Parameters
         ----------
         x: array
-            x-coordinates of bankline nodes, m
+            x-coordinates of profile nodes, m
         z: array
-            z-coordinates of bankline nodes, m
+            z-coordinates of profile nodes, m
         E: array
             riverbank surface temperature at x,z coordinate, degrees C
 
         Returns
         --------
         erosion: array
-            magnitudes of erosion at bankline nodes
+            magnitudes of erosion at profile nodes
 
 
         """
@@ -362,7 +362,7 @@ class IcyRiver:
         C_array = np.zeros_like(below_water) + self.C_water
         C_array[T[below_water] <= self.melt_temp] = self.C_ice
         erosion = np.zeros_like(z)
-        dT = np.abs(np.asarray(self.banklines[-1].T)[below_water] - T[below_water])
+        dT = np.abs(np.asarray(self.profiles[-1].T)[below_water] - T[below_water])
 
         erosion[below_water] = (
             -(
@@ -402,14 +402,14 @@ class IcyRiver:
         Parameters
         ----------
         x: array
-            x-coordinates of bankline nodes, m
+            x-coordinates of profile nodes, m
         z: array
-            z-coordinates of bankline nodes, m
+            z-coordinates of profile nodes, m
 
         Returns
         --------
         erosion: array
-            magnitudes of erosion at bankline nodes
+            magnitudes of erosion at profile nodes
 
 
         """
@@ -443,21 +443,21 @@ class IcyRiver:
         n_cols = (self.bank_height + self.lower_bound__depth + 1) / self.dx
         self.grid = RasterModelGrid((n_rows, n_cols), xy_spacing=self.spacing)
 
-    def create_initial_bankline(self):
+    def create_initial_profile(self):
         """
-        create bankline object - rectangle
+        create profile object - rectangle
 
         """
         # top
         x_top = np.linspace(
-            0, (self.bank_width), int(self.bank_width / self.bankline_dx)
+            0, (self.bank_width), int(self.bank_width / self.profile_dx)
         )
         z_top = np.ones_like(x_top) * (self.riverbed_z + self.bank_height)
         # bluff
         z_bluff = np.linspace(
             self.bank_height + self.riverbed_z,
             self.riverbed_z,
-            int(self.bank_height / self.bankline_dx),
+            int(self.bank_height / self.profile_dx),
         )
 
         x_bluff = np.ones_like(z_bluff) * self.bank_width
@@ -465,13 +465,12 @@ class IcyRiver:
         x_bed = np.arange(
             self.bank_width + self.dx,
             (self.bank_width + self.river_half_width) - self.dx,
-            self.bankline_dx,
+            self.profile_dx,
         )
         z_bed = np.ones_like(x_bed) * self.riverbed_z
 
         x = np.concatenate((x_top, x_bluff, x_bed))
         z = np.concatenate((z_top, z_bluff, z_bed))
-        # x, z = resample_bankline(xo, zo, self.bankline_dx)
 
         return x, z
 
@@ -527,18 +526,18 @@ class IcyRiver:
         ) * np.cos(np.pi * 2 * self.time / (self.air_temperature__period))
 
     def animate_riverbank_profile(self, folder="profile_movie/", dt=1):
-        for i in range(0, len(self.banklines), dt):
+        for i in range(0, len(self.profiles), dt):
             fig, ax = plt.subplots(1, 1)
             ax.fill_between(
-                x=self.banklines[i].x,
-                y1=self.banklines[i].z,
-                y2=np.ones_like(self.banklines[i].z) * -2,
+                x=self.profiles[i].x,
+                y1=self.profiles[i].z,
+                y2=np.ones_like(self.profiles[i].z) * -2,
                 color="brown",
             )
 
             # plt.colorbar(sc, label="surface temperature \n [$\degree$ C]")
             ax.set_title(
-                "bankline evolution \n DOY = " + str(int(self.banklines[i].age % 365))
+                "profile evolution \n DOY = " + str(int(self.profiles[i].age % 365))
             )
 
             ax.set_xlabel("x (m)")
@@ -549,7 +548,7 @@ class IcyRiver:
             plt.savefig(
                 folder
                 + "riverbankprofile"
-                + str(int(self.banklines[i].age * 100)).zfill(10)
+                + str(int(self.profiles[i].age * 100)).zfill(10)
                 + ".png",
                 dpi=500,
             )
@@ -592,7 +591,7 @@ def make_animation(folder, moviename):
 
 """
 under construction
-def resample_bankline(x, z, s_spacing):
+def resample_profile(x, z, s_spacing):
     ds = np.concatenate(
         ([0], np.cumsum(np.sqrt(np.diff(x) ** 2 + np.diff(z) ** 2)))
     )  # compute derivatives
