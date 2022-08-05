@@ -13,9 +13,11 @@ import matplotlib.pyplot as plt
 import os
 import imageio
 from scipy import interpolate
+from scipy.interpolate import UnivariateSpline
+import pandas as pd
 
 
-class Profile:
+class profile:
     """class for bank profile objects"""
 
     def __init__(self, x, z, T, t):
@@ -41,51 +43,57 @@ class Profile:
 
 class IcyRiver:
     def __init__(self, params={}):
+        # load stage data
+        self.load_river_stage_timeseries()
+
         # unpack parameters
 
-        # timing
+        ### timing
         self.final_time = params["run_duration"]
         self.time = 0
         self.dx = params["dx"]
         self.dt = params["dt"]
         self.save_dt = params["save_dt"]
 
-        # air temperature
+        ### air temperature
         self.air_temperature__mean = params["air_temperature__mean"]
         self.air_temperature__amplitude = params["air_temperature__amplitude"]
         self.air_temperature__period = params["air_temperature__period"]
         self.air_temp = self.air_temperature__mean - self.air_temperature__amplitude / 2
 
-        # riverbank geometry
-        self.river_stage = params["initial_river_stage"]
+        ### riverbank geometry
+        self.river_stage = self.stage_by_doy[0]
         self.river_half_width = params["river_half_width"]
         self.bank_height = params["bank_height"]
         self.bank_width = params["bank_width"]
         self.riverbed_z = 0
         self.riverbed_temp = params["riverbed_temp"]
         self.morph_factor = params["morph_factor"]
-        self.dzdxcrit = 4
-        # erosion rate constants
+
+        ##critical slope between notch and ledge
+        self.dzdxcrit = 1
+
+        ### subaerial erosion rate constant
         self.alpha_are = params["subaerial_erosion"]
 
-        # river temperature
+        ### river temperature and seasonality
         self.river_temp = 273.15
         self.river_temp_max = params["water_temperature__max"]
-
         self.trib = params["trib_doy"]  # 140 doy
         self.tfreeze = params["tfreeze_doy"]  # 310
         self.thighstage = self.trib + 31
 
-        # material properties
+        ### material properties
         self.L_ice = 334000  # J/kg
         self.C_ice = 2000  # J/kgK
         self.C_water = 4000  # J/kgK
         self.rho_ice = 917  # kg/m3
         self.k_ice = 2 * (60 * 60 * 24)  # J/daymK
-        self.k_perma = 1.5 * (60 * 60 * 24)  # J/daymK
-        self.rho_perma = 2200  # kg/m3
+        self.k_perma = 1 * (60 * 60 * 24)  # J/daymK
+        self.rho_perma = 3000  # kg/m3
         self.melt_temp = 273.15  # K
-        self.W = params["soil_percent_water"] / 100  # .3
+        self.W = params["water_content"] / 100  # .5
+
         # create landlab grid
         n_rows = (self.bank_height + abs(params["lower_bound__depth"]) + 1) / self.dx
         n_cols = (self.bank_width + self.river_half_width) / self.dx
@@ -95,12 +103,12 @@ class IcyRiver:
             xy_of_lower_left=(0, params["lower_bound__depth"]),
             xy_of_reference=(0, params["lower_bound__depth"]),
         )
-        # add fields for heat diffusion
+        ### add fields for heat diffusion
         self.T = self.grid.add_zeros("temperature", at="node")
         self.qT = self.grid.add_zeros("heat_flux", at="link")
 
         self.erosion = self.grid.add_zeros("eroded", at="node")
-        # divide core nodes into air, river, riverbed
+        ### divide core nodes into air, river, riverbed
 
         self.river_nodes = np.where(
             np.logical_and(
@@ -144,17 +152,17 @@ class IcyRiver:
         self.T[self.air_nodes] = self.air_temp
 
         # set initial profile
-        self.profile_dx = params["profile_dx"]  # m
+        self.profile_dz = params["profile_dz"]  # m
         self.profile_npts = np.ceil(
             (self.bank_width + self.bank_height + self.river_half_width)
-            / self.profile_dx
+            / self.profile_dz
         )
         x, z = self.create_initial_profile()
         # grab temperature at bnklne nodes
         T, node_ids = self.map_temp_to_bank(x, z)
         # save first profile object
         self.profiles = []
-        self.profiles.append(Profile(x, z, T, 0))
+        self.profiles.append(profile(x, z, T, 0))
 
     def run(self):
         """Run simulation from start to finish"""
@@ -165,6 +173,7 @@ class IcyRiver:
             # update bcs
             self.set_air_temperature()
             self.set_river_temperature()
+            self.river_stage = self.stage_by_doy[int(self.time % 365) - 1]
 
             self.T[self.air_nodes] = self.air_temp
             self.T[self.river_nodes] = self.river_temp
@@ -190,7 +199,8 @@ class IcyRiver:
             # calculate erosion
             if self.time > 365:
                 E = self.calc_thermal_erosion(x, z, T, dTdt[node_ids])
-                E += self.calc_slumping(x, z)
+                E += self.calc_failure(x, z)
+
             else:
                 E = np.zeros_like(x)
 
@@ -352,24 +362,127 @@ class IcyRiver:
 
 
         """
-
+        # vertical slope
         dzdx = np.concatenate((np.diff(z) / np.diff(x), [0]))
+        # nodes below water
+        below_water = np.where(
+            (z > self.riverbed_z) & (z <= self.river_stage)  # & (T < self.melt_temp)
+        )[0][:]
+
+        # list of nodes where ground ice is present and river wtare ihas thawed
+
+        # Latent heat of ice
+        L_array = np.ones_like(T) * self.L_ice
+        L_array[T >= self.melt_temp] = 0
+
+        # heat capacity of bulk permafrost
+        C_array = np.zeros_like(T) + self.C_water
+        C_array[T <= self.melt_temp] = self.C_ice
+
+        erosion = np.zeros_like(x)
+
+        H = np.zeros_like(x)
+        H[below_water] = self.river_stage - z[below_water]
+        S = 0.005
+        tau = 1000 * 9.81 * H * S
+        tauc = 10
+        # T(t) - T(t-1)
+        k_d = 0.0001
+        # Frozen erosion
+        if self.river_temp > self.melt_temp:
+            for i in below_water:
+                fluvial = -k_d * (tau[i] - tauc)
+
+                if T[i] < self.melt_temp:
+                    convection = -self.k_perma * (self.river_temp - T[i])
+                    denom = (
+                        (self.L_ice * self.rho_ice * self.W)
+                        / (self.rho_perma * self.C_ice)
+                    ) + (self.melt_temp - T[i])
+                    erosion[i] = (
+                        self.dt
+                        * self.morph_factor
+                        * (
+                            (fluvial * (self.melt_temp - T[i])) / denom
+                        )  # + convection / denom)
+                    )
+                else:
+                    erosion[i] = (
+                        self.dt
+                        * self.morph_factor
+                        * ((fluvial))  # + convection / denom)
+                    )
+
+        # Thawed erosion
+
+        # if np.sum(erosion) < 0:
+        #    print("melted! at DOY:" + str(int(self.time) % 365))
+
+        # subaerial melting
+        above_water_bot = np.where(z > self.river_stage)[0][-1]
+        above_water_top = np.where(z == self.bank_height)[0][-1]
+
+        erosion[above_water_bot:above_water_top] = (
+            -self.alpha_are * self.dt * (self.air_temp - self.melt_temp)
+        )
+        erosion[erosion > 0] = 0
+
+        if np.sum(erosion) < 0:
+            print("erosion")
+        return erosion
+
+    def calc_thermal_erosion_2(self, x, z, T, T_div):
+        """
+        commit subaerial and subaqueous melting
+
+        find temperature values on landlab grid at x,z profile coordinates
+        Parameters
+        ----------
+        x: array
+            x-coordinates of profile nodes, m
+        z: array
+            z-coordinates of profile nodes, m
+        E: array
+            riverbank surface temperature at x,z coordinate, degrees C
+
+        Returns
+        --------
+        erosion: array
+            magnitudes of erosion at profile nodes
+
+
+        """
+        # vertical slope
+        dzdx = np.concatenate((np.diff(z) / np.diff(x), [0]))
+        # nodes below water
         below_water = np.where((z > self.riverbed_z) & (z <= self.river_stage))[0][:]
+
+        # list of nodes where ground ice is present
         frozen_array = np.zeros_like(below_water)
         frozen_array[T[below_water] < self.melt_temp] = 1
+
+        # Latent heat of ice
         L_array = np.ones_like(below_water) * self.L_ice
         L_array[T[below_water] >= self.melt_temp] = 0
+
+        # heat capacity of bulk permafrost
         C_array = np.zeros_like(below_water) + self.C_water
         C_array[T[below_water] <= self.melt_temp] = self.C_ice
+
         erosion = np.zeros_like(z)
-        dT = np.abs(np.asarray(self.profiles[-1].T)[below_water] - T[below_water])
+
+        # T(t) - T(t-1)
+        dT = self.profiles[-1].T[below_water] - T[below_water]
 
         erosion[below_water] = (
             -(
                 frozen_array
                 * self.morph_factor
                 * self.k_perma
-                * ((self.river_temp - self.melt_temp) + self.dx * T_div[below_water])
+                * (
+                    (self.river_temp - self.melt_temp)
+                    + self.profile_dz * T_div[below_water]
+                )
                 / (
                     L_array * self.W * self.rho_ice
                     + (
@@ -395,9 +508,9 @@ class IcyRiver:
 
         return erosion
 
-    def calc_slumping(self, x, z):
+    def calc_failure(self, x, z):
         """
-        shear off overhang when bank extends past 45 degrees
+        shear off overhang when bank extends past critical slope
 
         Parameters
         ----------
@@ -414,65 +527,70 @@ class IcyRiver:
 
         """
         erosion = np.zeros(len(x))
-        hinge = np.where(
+        # find the node index of the left-most node
+        notch = np.where(
             x
             == np.min(x[np.where((z > self.riverbed_z) & (z < self.bank_height))[0][:]])
         )[0][0]
 
-        top = np.where(z == self.bank_height)[0][-1]
-        overhang = (z[top] - z[hinge]) / (x[top] - x[hinge])
+        # right-most point on horizontal surface
+        ledge = np.where(z == self.bank_height)[0][-1]
+        slopecrit = (z[ledge] - z[notch]) / (x[ledge] - x[notch])
         # print((x[hinge] - x[top]))
-        if (overhang <= self.dzdxcrit) & (overhang > 0):
-
-            notch = np.where((x >= x[hinge]) & (z > z[hinge]))[0][:]
+        if (slopecrit <= self.dzdxcrit) & (slopecrit > 0):
+            # all nodes between ledge and notch
+            overhang = np.where((x >= x[notch]) & (z > z[notch]))[0][:]
             # print(len(notch))
-
-            buddy = x
-            erosion[notch] = x[hinge] - x[notch]
+            erosion[overhang] = x[notch] - x[overhang]
             erosion[erosion > 0] = 0
-
             # erosion[erosion > 0] = 0
-            print("slump! at DOY: " + str(int(self.time % 365)))
+            print("slope failure at DOY: " + str(int(self.time % 365)))
         return erosion
 
     def create_grid(self):
         """
-        create riverbank landlab grid
+        create river bank landlab grid
         """
         n_rows = (self.bank_width + self.river_half_width) / self.dx
         n_cols = (self.bank_height + self.lower_bound__depth + 1) / self.dx
         self.grid = RasterModelGrid((n_rows, n_cols), xy_spacing=self.spacing)
 
-    def create_initial_profile(self):
+    def create_initial_profile(self, options="rectangle"):
         """
-        create profile object - rectangle
+        create profile object based on initial condition parameters
+        options are a rectangle or CR22_T5_bank1.
 
         """
-        # top
-        x_top = np.linspace(
-            0, (self.bank_width), int(self.bank_width / self.profile_dx)
-        )
-        z_top = np.ones_like(x_top) * (self.riverbed_z + self.bank_height)
-        # bluff
-        z_bluff = np.linspace(
-            self.bank_height + self.riverbed_z,
-            self.riverbed_z,
-            int(self.bank_height / self.profile_dx),
-        )
+        if options == "rectangle":
+            # top
+            x_top = np.linspace(
+                0, (self.bank_width), int(self.bank_width / self.profile_dz)
+            )
+            z_top = np.ones_like(x_top) * (self.riverbed_z + self.bank_height)
+            # bluff
+            z_bluff = np.linspace(
+                self.bank_height + self.riverbed_z,
+                self.riverbed_z,
+                int(self.bank_height / self.profile_dz),
+            )
 
-        x_bluff = np.ones_like(z_bluff) * self.bank_width
-        # bed
-        x_bed = np.arange(
-            self.bank_width + self.dx,
-            (self.bank_width + self.river_half_width) - self.dx,
-            self.profile_dx,
-        )
-        z_bed = np.ones_like(x_bed) * self.riverbed_z
+            x_bluff = np.ones_like(z_bluff) * self.bank_width
+            # bed
+            x_bed = np.arange(
+                self.bank_width + self.dx,
+                (self.bank_width + self.river_half_width) - self.dx,
+                self.profile_dz,
+            )
+            z_bed = np.ones_like(x_bed) * self.riverbed_z
 
-        x = np.concatenate((x_top, x_bluff, x_bed))
-        z = np.concatenate((z_top, z_bluff, z_bed))
+            x = np.concatenate((x_top, x_bluff, x_bed))
+            z = np.concatenate((z_top, z_bluff, z_bed))
 
         return x, z
+
+    def load_river_stage_timeseries(self, filepath="data/staines_depth_at_DOY.csv"):
+        df = pd.read_csv(filepath)
+        self.stage_by_doy = df.Depth.values
 
     def set_river_temperature(self):
         """
@@ -591,6 +709,7 @@ def make_animation(folder, moviename):
 
 """
 under construction
+
 def resample_profile(x, z, s_spacing):
     ds = np.concatenate(
         ([0], np.cumsum(np.sqrt(np.diff(x) ** 2 + np.diff(z) ** 2)))
